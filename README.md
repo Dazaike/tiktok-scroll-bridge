@@ -2,6 +2,8 @@
 
 A local AutoHotkey-to-Chrome bridge for scrolling TikTok without taking focus from the current window.
 
+Current release: `v1.0.1`. See `CHANGELOG.md` for release notes.
+
 ## Requirements
 
 - Windows

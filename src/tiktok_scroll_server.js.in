@@ -1,0 +1,152 @@
+const http = require("node:http");
+const { createHash } = require("node:crypto");
+
+const HOST = "127.0.0.1";
+const PORT = 38421;
+const TOKEN = "__BRIDGE_TOKEN__";
+const clients = new Set();
+const pending = new Map();
+let nextId = 0;
+
+function reply(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+  res.end(JSON.stringify(body));
+}
+
+const server = http.createServer((req, res) => {
+  if (req.method === "GET" && req.url === "/health")
+    return reply(res, 200, { ok: true, extensionConnected: clients.size > 0 });
+
+  if (req.method !== "POST" || req.url !== "/scroll")
+    return reply(res, 404, { error: "Not found" });
+  if (req.headers["x-bridge-token"] !== TOKEN)
+    return reply(res, 401, { error: "Invalid bridge token" });
+  if (!req.headers["content-type"]?.startsWith("application/json"))
+    return reply(res, 415, { error: "Expected application/json" });
+
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", chunk => {
+    body += chunk;
+    if (body.length > 1024) req.destroy();
+  });
+  req.on("end", () => {
+    let command;
+    try { command = JSON.parse(body); }
+    catch { return reply(res, 400, { error: "Invalid JSON" }); }
+
+    if (command.direction !== "up" && command.direction !== "down")
+      return reply(res, 400, { error: "Direction must be up or down" });
+
+    const socket = clients.values().next().value;
+    if (!socket || socket.destroyed)
+      return reply(res, 503, { error: "Extension is not connected; open the TikTok page in Chrome" });
+
+    const id = String(++nextId);
+    const timeout = setTimeout(() => {
+      pending.delete(id);
+      if (!res.headersSent) reply(res, 504, { error: "Chrome did not respond in time" });
+    }, 2500);
+    pending.set(id, { res, timeout });
+    sendFrame(socket, 0x1, JSON.stringify({ type: "scroll", id, direction: command.direction }));
+  });
+});
+
+server.on("upgrade", (req, socket) => {
+  const protocols = (req.headers["sec-websocket-protocol"] || "").split(",").map(s => s.trim());
+  const key = req.headers["sec-websocket-key"];
+  if (req.url !== "/extension" || !protocols.includes(TOKEN) || !key || req.headers["sec-websocket-version"] !== "13") {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return;
+  }
+
+  const accept = createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+    `Sec-WebSocket-Accept: ${accept}\r\n` +
+    "Sec-WebSocket-Protocol: tiktok-scroll\r\n\r\n"
+  );
+  socket.buffer = Buffer.alloc(0);
+  clients.add(socket);
+  socket.on("data", chunk => readFrames(socket, chunk));
+  socket.on("close", () => removeClient(socket));
+  socket.on("error", () => removeClient(socket));
+});
+
+function readFrames(socket, chunk) {
+  socket.buffer = Buffer.concat([socket.buffer, chunk]);
+  while (socket.buffer.length >= 2) {
+    const first = socket.buffer[0];
+    const second = socket.buffer[1];
+    let length = second & 0x7f;
+    let offset = 2;
+    if (length === 126) {
+      if (socket.buffer.length < 4) return;
+      length = socket.buffer.readUInt16BE(2);
+      offset = 4;
+    } else if (length === 127) {
+      if (socket.buffer.length < 10) return;
+      const bigLength = socket.buffer.readBigUInt64BE(2);
+      if (bigLength > 1024n) return socket.destroy();
+      length = Number(bigLength);
+      offset = 10;
+    }
+    const masked = (second & 0x80) !== 0;
+    if (!masked || length > 1024) return socket.destroy();
+    if (socket.buffer.length < offset + 4 + length) return;
+    const mask = socket.buffer.subarray(offset, offset + 4);
+    const payload = Buffer.from(socket.buffer.subarray(offset + 4, offset + 4 + length));
+    for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i & 3];
+    socket.buffer = socket.buffer.subarray(offset + 4 + length);
+
+    const opcode = first & 0x0f;
+    if (opcode === 0x8) return socket.end();
+    if (opcode === 0x9) {
+      sendFrame(socket, 0xA, payload);
+      continue;
+    }
+    if (opcode !== 0x1) continue;
+    let message;
+    try { message = JSON.parse(payload.toString("utf8")); }
+    catch { continue; }
+    if (message.type === "ping") {
+      sendFrame(socket, 0x1, JSON.stringify({ type: "pong" }));
+    } else if (message.type === "result") {
+      const result = pending.get(String(message.id));
+      if (!result) continue;
+      clearTimeout(result.timeout);
+      pending.delete(String(message.id));
+      reply(result.res, message.ok ? 200 : 409, { ok: !!message.ok, error: message.error || undefined });
+    }
+  }
+}
+
+function sendFrame(socket, opcode, value) {
+  const payload = Buffer.isBuffer(value) ? value : Buffer.from(value);
+  let header;
+  if (payload.length < 126) {
+    header = Buffer.from([0x80 | opcode, payload.length]);
+  } else if (payload.length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    throw new Error("WebSocket payload too large");
+  }
+  socket.write(Buffer.concat([header, payload]));
+}
+
+function removeClient(socket) {
+  clients.delete(socket);
+}
+
+server.listen(PORT, HOST, () => console.log(`TikTok scroll bridge listening on http://${HOST}:${PORT}`));
+
+process.on("exit", () => {
+  for (const { res, timeout } of pending.values()) {
+    clearTimeout(timeout);
+    if (!res.headersSent) reply(res, 503, { error: "Bridge stopped" });
+  }
+});

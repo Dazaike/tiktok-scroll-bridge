@@ -1,0 +1,6 @@
+runtime/
+release/*.zip
+node_modules/
+.env
+.env.*
+*.log

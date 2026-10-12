@@ -1,0 +1,61 @@
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+
+BridgeUrl := "http://127.0.0.1:38421/scroll"
+BridgeServer := A_ScriptDir "\tiktok_scroll_server.js"
+BridgeToken := "__BRIDGE_TOKEN__"
+EnsureBridge()
+
+EnsureBridge() {
+    global BridgeUrl, BridgeServer
+    try {
+        request := ComObject("WinHttp.WinHttpRequest.5.1")
+        request.Open("GET", "http://127.0.0.1:38421/health", false)
+        request.Send()
+        if (request.Status = 200)
+            return
+    }
+
+    Run('node "' BridgeServer '"', A_ScriptDir, "Hide")
+    Loop 30 {
+        Sleep(100)
+        try {
+            request := ComObject("WinHttp.WinHttpRequest.5.1")
+            request.Open("GET", "http://127.0.0.1:38421/health", false)
+            request.Send()
+            if (request.Status = 200)
+                return
+        }
+    }
+    ShowMessage("Could not start the bridge. Check that Node.js is installed.")
+}
+
+; Numpad 6 / keypad-right: previous feed item (scroll up).
+Numpad6::ScrollTikTok("up")
+NumpadRight::ScrollTikTok("up")
+
+; Numpad 3 / keypad-page-down: next feed item (scroll down).
+Numpad3::ScrollTikTok("down")
+NumpadPgDn::ScrollTikTok("down")
+
+ScrollTikTok(direction) {
+    global BridgeUrl, BridgeToken
+    try {
+        request := ComObject("WinHttp.WinHttpRequest.5.1")
+        request.Open("POST", BridgeUrl, false)
+        request.SetTimeouts(500, 500, 500, 3500)
+        request.SetRequestHeader("Content-Type", "application/json")
+        request.SetRequestHeader("X-Bridge-Token", BridgeToken)
+        request.Send('{"direction":"' direction '"}')
+
+        if (request.Status != 200)
+            ShowMessage(request.ResponseText)
+    } catch {
+        ShowMessage("Bridge unavailable. Start tiktok_scroll_server.js and open TikTok in Chrome.")
+    }
+}
+
+ShowMessage(message) {
+    ToolTip(message)
+    SetTimer(() => ToolTip(), -2500)
+}

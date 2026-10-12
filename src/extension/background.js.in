@@ -1,0 +1,83 @@
+const BRIDGE_TOKEN = "__BRIDGE_TOKEN__";
+let socket;
+let reconnectTimer;
+let keepAliveTimer;
+
+function connect() {
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  clearTimeout(reconnectTimer);
+  const ws = new WebSocket("ws://127.0.0.1:38421/extension", ["tiktok-scroll", BRIDGE_TOKEN]);
+  socket = ws;
+
+  ws.onopen = () => {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "ping" }));
+    }, 20000);
+  };
+  ws.onmessage = event => {
+    let command;
+    try { command = JSON.parse(event.data); }
+    catch { return; }
+    if (command.type === "scroll") handleScroll(ws, command);
+  };
+  ws.onclose = () => {
+    clearInterval(keepAliveTimer);
+    if (socket === ws) socket = undefined;
+    reconnectTimer = setTimeout(connect, 3000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+async function handleScroll(ws, command) {
+  let ok = false;
+  let error = "No TikTok tab is open in this browser";
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const tabs = await chrome.tabs.query({ url: "https://www.tiktok.com/*" });
+    const tab = (activeTab?.url?.startsWith("https://www.tiktok.com/") ? activeTab : undefined)
+      || tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))[0];
+    if (tab?.id) {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: scrollFeed,
+        args: [command.direction]
+      });
+      ok = !!result?.result;
+      error = ok ? "" : "No scrollable TikTok feed found";
+    }
+  } catch (e) {
+    error = e.message || "Could not scroll the TikTok tab";
+  }
+
+  if (ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({ type: "result", id: command.id, ok, error }));
+}
+
+function scrollFeed(direction) {
+  if (direction !== "up" && direction !== "down") return false;
+  const video = [...document.querySelectorAll("video")].find(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.top < innerHeight;
+  });
+
+  let target;
+  for (let element = video?.parentElement; element && element !== document.documentElement; element = element.parentElement) {
+    const overflowY = getComputedStyle(element).overflowY;
+    if ((overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay") &&
+        element.scrollHeight > element.clientHeight + 10) {
+      target = element;
+      break;
+    }
+  }
+
+  target ||= document.scrollingElement;
+  if (!target || target.scrollHeight <= target.clientHeight + 10) return false;
+  const distance = Math.max(target.clientHeight || innerHeight, 400) * 0.9;
+  target.scrollBy({ top: direction === "down" ? distance : -distance, behavior: "smooth" });
+  return true;
+}
+
+chrome.runtime.onInstalled.addListener(connect);
+chrome.runtime.onStartup.addListener(connect);
+connect();
